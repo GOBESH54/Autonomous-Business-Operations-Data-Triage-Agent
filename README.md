@@ -106,7 +106,7 @@ docker run --rm -p 8000:8000 mcp-agentic-workflow-engine
 
 Set `GEMINI_API_KEY` in the container environment to enable Gemini. The image seeds its sample database during build.
 
-## Interview guide
+## Guide
 
 **MCP client/server lifecycle:** the agent starts the local MCP server as a stdio subprocess, performs protocol initialization, discovers available tools, then invokes a tool or reads a resource. MCP carries structured JSON-RPC messages over the process streams; the agent consumes protocol results rather than importing server functions. The server owns tool validation and data access.
 
