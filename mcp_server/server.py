@@ -7,7 +7,21 @@ import re
 import sqlite3
 import math
 from collections import Counter
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ModuleNotFoundError:  # MCP SDK 2.x renamed FastMCP; retain local compatibility.
+    from mcp.server.mcpserver import MCPServer
+
+    class FastMCP(MCPServer):
+        """Small compatibility adapter; production dependency is pinned to MCP 1.x."""
+
+        def __init__(self, name: str, version: str = "", description: str = ""):
+            super().__init__(name=name, version=version, description=description)
+
+        def run(self) -> None:
+            import anyio
+
+            anyio.run(self.run_stdio_async)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "business.db")

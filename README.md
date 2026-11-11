@@ -1,303 +1,126 @@
 # MCP Agentic Workflow Engine
 
-> Production-style autonomous business operations agent powered by **LangGraph**, **Model Context Protocol (MCP)**, **RAG memory**, and **FastAPI**.
+A runnable business operations agent built with FastAPI, LangGraph, Google's Gemini model (optional), and the official Python MCP SDK. In the default offline mode, a deterministic local planner keeps the project usable without an API key.
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green.svg)](https://fastapi.tiangolo.com)
-[![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-orange.svg)](https://github.com/langchain-ai/langgraph)
-[![MCP](https://img.shields.io/badge/MCP-1.0+-purple.svg)](https://modelcontextprotocol.io)
+## Architecture
 
----
-
-## 🏗️ Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                        FastAPI Backend (app/main.py)                     │
-│  ┌──────────────┐  ┌──────────────────┐  ┌─────────────────────────┐   │
-│  │ POST /agent  │  │ GET /agent/stream│  │ GET /health             │   │
-│  │    /run      │  │     (SSE)        │  │                         │   │
-│  └──────┬───────┘  └────────┬─────────┘  └─────────────────────────┘   │
-│         │                   │                                           │
-│         ▼                   ▼                                           │
-│  ┌──────────────────────────────────────────────────────────────┐       │
-│  │              LangGraph StateGraph (agent/workflow.py)        │       │
-│  │                                                              │       │
-│  │  ┌─────────────┐    ┌──────────────┐    ┌───────────────┐   │       │
-│  │  │   Router/   │───▶│    Tool      │───▶│  Validator/   │   │       │
-│  │  │  Planner    │    │  Executor    │    │ Self-Correct  │   │       │
-│  │  └─────────────┘    │  (MCP Tools) │    └───────┬───────┘   │       │
-│  │        ▲            └──────────────┘            │           │       │
-│  │        │                                         │           │       │
-│  │        │  ◀── correction loop (max 3) ──────────┤           │       │
-│  │        │                                         │           │       │
-│  │        │                               ┌─────────▼────────┐ │       │
-│  │        │                               │   Synthesizer    │ │       │
-│  │        │                               │  (Final Answer)  │ │       │
-│  │        │                               └──────────────────┘ │       │
-│  │  ┌─────────────────────────────────────────────────────┐    │       │
-│  │  │         MemorySaver (Conversation Checkpointer)     │    │       │
-│  │  └─────────────────────────────────────────────────────┘    │       │
-│  └──────────────────────────────────────────────────────────────┘       │
-│                              │                                          │
-│                              ▼                                          │
-│  ┌──────────────────────────────────────────────────────────────┐       │
-│  │              MCP Server (mcp_server/server.py)               │       │
-│  │                                                              │       │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐   │       │
-│  │  │query_business│ │search_policy │ │ create_action      │   │       │
-│  │  │    _db()     │ │   _docs()    │ │   _ticket()        │   │       │
-│  │  └──────┬───────┘ └──────┬───────┘ └────────┬───────────┘   │       │
-│  │         │                │                   │               │       │
-│  │  ┌──────▼───────┐ ┌──────▼───────┐ ┌────────▼───────────┐   │       │
-│  │  │  SQLite DB   │ │  TF-IDF RAG  │ │  Action Tickets    │   │       │
-│  │  │ (business.db)│ │  (policies/) │ │  (database write)  │   │       │
-│  │  └──────────────┘ └──────────────┘ └────────────────────┘   │       │
-│  │                                                              │       │
-│  │  Resource: config://schema → Database table definitions      │       │
-│  └──────────────────────────────────────────────────────────────┘       │
-└──────────────────────────────────────────────────────────────────────────┘
+```text
+Client
+  | REST / SSE
+  v
+FastAPI (app/main.py)
+  |
+  v
+LangGraph StateGraph -- MemorySaver (thread_id)
+  | Planner -> MCP Executor -> Validator --retry--> Planner
+  |                                      \----------> Synthesizer
+  v
+MCP Python Client (stdio / JSON-RPC)
+  |
+  v
+FastMCP server (mcp_server/server.py)
+  |-- query_business_db       -> read-only SQLite
+  |-- search_policy_docs      -> local TF-IDF retrieval over Markdown
+  |-- create_action_ticket    -> SQLite action_tickets table
+  `-- config://schema         -> database schema resource
 ```
 
----
+## Quick start
 
-## 📁 Project Structure
-
-```
-mcp-agentic-workflow-engine/
-├── app/
-│   ├── __init__.py
-│   └── main.py                 # FastAPI service with REST + SSE endpoints
-├── agent/
-│   ├── __init__.py
-│   └── workflow.py             # LangGraph StateGraph + MCP tool integration
-├── mcp_server/
-│   ├── __init__.py
-│   └── server.py               # MCP server with FastMCP (3 tools + 1 resource)
-├── data/
-│   ├── business.db             # SQLite database (auto-generated by seed)
-│   └── policies/               # SOP/policy markdown documents
-│       ├── sla_policy.md
-│       ├── refund_policy.md
-│       ├── escalation_procedures.md
-│       └── data_handling_policy.md
-├── tests/
-│   ├── __init__.py
-│   └── test_end_to_end.py      # Comprehensive pytest suite
-├── seed_data.py                # Database & policy document seeder
-├── requirements.txt
-├── pyproject.toml
-├── Dockerfile
-├── .env.example
-└── README.md
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Clone & Setup
+Python 3.10 or newer is recommended.
 
 ```bash
-git clone https://github.com/GOBESH54/Autonomous-Business-Operations-Data-Triage-Agent.git
-cd mcp-agentic-workflow-engine
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate   # Linux/macOS
-venv\Scripts\activate      # Windows
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 2. Configure Environment
-
-```bash
-cp .env.example .env
-# Edit .env and set GEMINI_API_KEY (optional — mock mode works without it)
-```
-
-### 3. Seed Data
-
-```bash
+python -m venv .venv
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -r requirements.txt
 python seed_data.py
 ```
 
-### 4. Run Tests
-
-```bash
-pytest tests/ -v
-```
-
-### 5. Start the API Server
+Copy `.env.example` to `.env` and optionally set `GEMINI_API_KEY`. Without a key, the deterministic mock planner is used. Start the API:
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-### 6. Try It Out
+Interactive API documentation is at `http://localhost:8000/docs`.
 
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Run an agent task
-curl -X POST http://localhost:8000/api/v1/agent/run \
-  -H "Content-Type: application/json" \
-  -d '{"task": "Find all enterprise customers with open critical tickets", "thread_id": "demo-1"}'
-
-# Stream agent steps (SSE)
-curl -N "http://localhost:8000/api/v1/agent/stream?task=What+is+our+SLA+policy"
-```
-
----
-
-## 🐳 Docker
-
-```bash
-docker build -t mcp-workflow-engine .
-docker run -p 8000:8000 -e GEMINI_API_KEY=your_key mcp-workflow-engine
-```
-
----
-
-## 🔧 MCP Server Tools
-
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `query_business_db` | Read-only SQL against business DB | `sql_query: str` |
-| `search_policy_docs` | TF-IDF search over policy markdowns | `query: str` |
-| `create_action_ticket` | Create workflow action tickets | `customer_id, issue_summary, priority, resolution_action` |
-
-| Resource | URI | Description |
-|----------|-----|-------------|
-| Database Schema | `config://schema` | Returns all table definitions with column types |
-
----
-
-## 🧠 LangGraph State Machine
-
-### State Transitions
-
-```
-START
-  │
-  ▼
-┌─────────────────┐
-│ Router/Planner  │  Analyzes task → determines tool calls
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Tool Executor   │  Calls MCP tools (DB, policy search, tickets)
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐    ┌──── YES ──── Loop back to Router (max 3x)
-│   Validator     │────┤
-│ (Self-Correct)  │    └──── NO  ──── Continue to Synthesizer
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Synthesizer    │  Produces final human-readable response
-└────────┬────────┘
-         │
-         ▼
-       END
-```
-
-### Key Concepts
-
-- **State**: A Pydantic model carrying messages, plans, tool results, correction count, and execution trace
-- **MemorySaver**: LangGraph checkpointer enabling multi-turn conversation via `thread_id`
-- **Self-Correction**: The Validator node detects SQL errors or tool failures and loops back to the Planner (up to 3 retries)
-- **Mock LLM**: When `GEMINI_API_KEY` is not set, a deterministic mock LLM ensures all tests pass locally
-
----
-
-## 📡 API Endpoints
+## API
 
 ### `GET /health`
-Health check returning service status and version.
+
+Returns service health and version.
 
 ### `POST /api/v1/agent/run`
-Execute a business task synchronously.
 
-**Request:**
 ```json
 {
-  "task": "Find customers with SLA breaches this quarter",
-  "thread_id": "session-123"
+  "task": "What is our SLA policy for critical tickets?",
+  "thread_id": "operations-demo"
 }
 ```
 
-**Response:**
-```json
-{
-  "response": "Based on my analysis...",
-  "thread_id": "session-123",
-  "trace": [
-    {"node": "router_planner", "timestamp": "...", "plan": "..."},
-    {"node": "tool_executor", "tool": "query_business_db", "status": "success"},
-    {"node": "validator", "needs_correction": false},
-    {"node": "synthesizer", "response_length": 450}
-  ],
-  "tool_results": [
-    {"tool": "query_business_db", "result": "Query returned 5 row(s)..."}
-  ],
-  "timestamp": "2024-01-15T10:30:00"
-}
-```
+Returns the synthesized response, thread ID, tool results, and node/tool execution trace. Omit `thread_id` to start a new conversation.
 
 ### `GET /api/v1/agent/stream?task=...&thread_id=...`
-Stream agent steps via Server-Sent Events (SSE).
 
----
+Streams workflow node updates as Server-Sent Events. Each event has an `agent_step` type; the stream ends with `complete` or `error`.
 
-## 🎓 Interview Explanation Guide
+## MCP capabilities
 
-### MCP Client-Server Lifecycle
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `query_business_db(sql_query)` | Tool | Executes a single read-only `SELECT` against `data/business.db`. |
+| `search_policy_docs(query)` | Tool | Retrieves matching local SOP excerpts with TF-IDF cosine scoring. |
+| `create_action_ticket(customer_id, issue_summary, priority, resolution_action)` | Tool | Records a validated workflow action and returns its ID. |
+| `config://schema` | Resource | Exposes table and column definitions to MCP clients. |
 
-1. **Initialization**: The MCP server registers tools (`@mcp_app.tool()`) and resources (`@mcp_app.resource()`) with metadata (name, description, parameter schemas).
-2. **Discovery**: The MCP client connects and calls `list_tools()` / `list_resources()` to discover available capabilities.
-3. **Invocation**: When the agent needs data, it sends a `call_tool` request with the tool name and arguments. The server validates inputs, executes the function, and returns structured results.
-4. **Resource Access**: Resources (like `config://schema`) provide static/semi-static context that the agent can read without executing a tool call.
-5. **Error Handling**: Tool errors are returned as structured error responses, enabling the agent's self-correction loop to retry with fixed parameters.
+The database query tool opens SQLite in read-only mode and rejects non-`SELECT` statements and destructive SQL keywords. Ticket creation is the only business database write exposed by the server. Policy retrieval uses a dependency-light TF-IDF implementation, so it works without network access or embedding downloads.
 
-### LangGraph State Transitions
+## LangGraph lifecycle
 
-1. **Entry → Router/Planner**: The user's task enters as the initial state. The LLM analyzes the request and generates a plan with specific tool calls.
-2. **Planner → Tool Executor**: The plan's tool calls are executed sequentially against the MCP tools. Results are appended to the state.
-3. **Tool Executor → Validator**: The validator inspects each tool result for error patterns (`SQL_ERROR`, `TOOL_ERROR`). If errors are found and the correction budget remains, it routes back to the Planner.
-4. **Validator → Synthesizer (or → Planner)**: On success, the synthesizer uses all tool results to compose a comprehensive human-readable answer.
-5. **Memory Persistence**: The `MemorySaver` checkpointer stores the full state at each node, enabling multi-turn conversations via `thread_id`.
+1. **Router / Planner** reads the current task and selects a tool. Gemini is used when configured; otherwise the deterministic mock planner runs.
+2. **Tool Executor** launches the MCP server over stdio, initializes an MCP `ClientSession`, discovers tools with `list_tools`, and calls the requested tool. Schema access uses `read_resource` for `config://schema`.
+3. **Validator** detects SQL, database, and MCP tool errors. It sends the error back to the planner for up to three correction attempts.
+4. **Final Synthesizer** combines the tool result into a user-facing response.
+5. **MemorySaver** checkpoints graph state by `thread_id` for conversation continuity in the process lifetime. The in-memory checkpointer is not durable across restarts or multiple workers.
 
-### RAG Memory Implementation
+## Seed data and tests
 
-- **Indexing**: Policy documents are tokenized and indexed using TF-IDF (Term Frequency × Inverse Document Frequency) at module load time.
-- **Retrieval**: Query tokens are matched against the document index using cosine similarity. The top-K most relevant documents are returned.
-- **Section Extraction**: Within matched documents, the most relevant section (split by `##` headers) is identified and returned to minimize context window usage.
+`seed_data.py` creates sample customers, orders, support tickets (including urgent/SLA cases), action ticket schema, and four policy documents. It is safe to run repeatedly; it resets the local sample database.
 
----
+```bash
+python seed_data.py
+pytest -q
+```
 
-## 🧪 Test Coverage
+The end-to-end tests cover seeded data, SQL safety, retrieval, ticket creation, MCP stdio discovery and resource reads, graph correction behavior, REST endpoints, and SSE responses.
 
-| Category | Tests | Description |
-|----------|-------|-------------|
-| Database Seeding | 8 | Table creation, data integrity, foreign keys, SLA tickets |
-| Policy Documents | 3 | File creation, content validation |
-| MCP Tools | 11 | SQL queries, safety blocks, policy search, ticket creation |
-| LangGraph Workflow | 8 | Node execution, trace completeness, correction loop, streaming |
-| FastAPI Endpoints | 8 | Health, run, stream, validation, OpenAPI schema |
-| Integration | 3 | Full workflow flows, multi-turn conversations |
+## Docker
 
-**Total: 41 tests**
+```bash
+docker build -t mcp-agentic-workflow-engine .
+docker run --rm -p 8000:8000 mcp-agentic-workflow-engine
+```
 
----
+Set `GEMINI_API_KEY` in the container environment to enable Gemini. The image seeds its sample database during build.
 
-## 📜 License
+## Interview guide
 
-MIT License — see [LICENSE](LICENSE) for details.
+**MCP client/server lifecycle:** the agent starts the local MCP server as a stdio subprocess, performs protocol initialization, discovers available tools, then invokes a tool or reads a resource. MCP carries structured JSON-RPC messages over the process streams; the agent consumes protocol results rather than importing server functions. The server owns tool validation and data access.
 
+**LangGraph transitions:** the planner writes selected calls into graph state, the executor adds MCP results and trace entries, and the validator routes either back to planning or forward to synthesis. A bounded retry count prevents infinite correction loops. `MemorySaver` associates checkpoints with a conversation's `thread_id`.
+
+**RAG choice:** policy Markdown is tokenized locally and ranked with TF-IDF cosine similarity. The retriever returns excerpts with source filenames. This provides a no-download fallback; an embedding model and FAISS index could replace it when semantic vectors are available.
+
+## Project layout
+
+```text
+app/main.py                 FastAPI REST and SSE API
+agent/workflow.py           LangGraph nodes, memory, MCP client adapter
+mcp_server/server.py        FastMCP tools and schema resource
+seed_data.py                Sample SQLite and policy document seeder
+data/policies/              Company policy Markdown
+tests/test_end_to_end.py    Integration and API tests
+```

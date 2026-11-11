@@ -9,17 +9,22 @@ import os
 import re
 import sqlite3
 import math
+import sys
 from collections import Counter
 from datetime import datetime
 from typing import Any, Literal, TypedDict, Annotated
 
+from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 # ── Configuration ──────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "business.db")
 POLICIES_DIR = os.path.join(BASE_DIR, "data", "policies")
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 USE_MOCK_LLM = not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here"
@@ -251,6 +256,54 @@ TOOLS_REGISTRY = {
 
 
 # ── Mock LLM for offline/test mode ────────────────────────────
+def _mock_sql_for_task(task: str) -> str:
+    """Select useful, schema-aware SQL templates for common offline demo tasks."""
+    text = task.lower()
+    limit_match = re.search(r"\b(?:top|first|last)\s+(\d+)\b", text)
+    limit = min(int(limit_match.group(1)), 100) if limit_match else 20
+
+    if "ticket" in text or "sla breach" in text:
+        join_customer = "enterprise" in text or "customer name" in text or "customer details" in text
+        columns = "t.id, c.name AS customer, t.subject, t.priority, t.status, t.sla_deadline" if join_customer else "id, customer_id, subject, priority, status, sla_deadline"
+        source = "support_tickets t JOIN customers c ON c.id = t.customer_id" if join_customer else "support_tickets"
+        filters = []
+        if "enterprise" in text:
+            filters.append("c.plan = 'enterprise'")
+        if "critical" in text:
+            filters.append("t.priority = 'critical'" if join_customer else "priority = 'critical'")
+        if "high" in text:
+            filters.append("t.priority = 'high'" if join_customer else "priority = 'high'")
+        if "open" in text or "unresolved" in text:
+            filters.append("t.status IN ('open', 'in_progress')" if join_customer else "status IN ('open', 'in_progress')")
+        if "breach" in text or "overdue" in text:
+            filters.append("t.sla_deadline < datetime('now') AND t.status NOT IN ('resolved', 'closed')" if join_customer else "sla_deadline < datetime('now') AND status NOT IN ('resolved', 'closed')")
+        where = f" WHERE {' AND '.join(filters)}" if filters else ""
+        return f"SELECT {columns} FROM {source}{where} ORDER BY sla_deadline LIMIT {limit}"
+
+    if "order" in text or "revenue" in text or "sales" in text:
+        if "top customer" in text or "order count" in text or "most orders" in text:
+            return (
+                "SELECT c.id, c.name, COUNT(o.id) AS order_count "
+                "FROM customers c LEFT JOIN orders o ON o.customer_id = c.id "
+                f"GROUP BY c.id, c.name ORDER BY order_count DESC LIMIT {limit}"
+            )
+        if "revenue" in text or "sales" in text or "total amount" in text:
+            return "SELECT status, COUNT(*) AS order_count, ROUND(SUM(amount), 2) AS revenue FROM orders GROUP BY status ORDER BY revenue DESC"
+        return f"SELECT id, customer_id, product, amount, status, order_date FROM orders ORDER BY order_date DESC LIMIT {limit}"
+
+    if "customer" in text:
+        if "how many" in text or "count" in text or "number of" in text:
+            plan = re.search(r"\b(free|pro|enterprise)\b", text)
+            if plan:
+                return f"SELECT COUNT(*) AS customer_count FROM customers WHERE plan = '{plan.group(1)}'"
+            return "SELECT COUNT(*) AS customer_count FROM customers"
+        plan = re.search(r"\b(free|pro|enterprise)\b", text)
+        condition = f" WHERE plan = '{plan.group(1)}'" if plan else ""
+        return f"SELECT id, name, email, plan, region FROM customers{condition} ORDER BY id LIMIT {limit}"
+
+    return f"SELECT id, name, email, plan, region FROM customers ORDER BY id LIMIT {limit}"
+
+
 class MockLLM:
     """Deterministic mock LLM that generates reasonable tool calls and responses."""
 
@@ -265,63 +318,82 @@ class MockLLM:
 
         last_lower = last_msg.lower()
 
-        # If we have tool results in the message history, synthesize a final answer
-        has_tool_results = any(
-            (isinstance(m, dict) and m.get("role") == "tool")
+        # Correction messages must be handled before normal tool-result synthesis.
+        correction = any(
+            isinstance(m, dict) and m.get("role") == "system" and "previous tool call" in m.get("content", "")
             for m in messages
         )
 
-        if has_tool_results:
+        # If we have tool results in the message history, synthesize a final answer
+        has_tool_results = any(
+            isinstance(m, dict) and m.get("role") == "tool" for m in messages
+        ) and last_lower.startswith("based on the tool results")
+
+        if has_tool_results and not correction:
+            last_user_index = max(
+                (index for index, message in enumerate(messages[:-1])
+                 if isinstance(message, dict) and message.get("role") == "user"),
+                default=-1,
+            )
+            results = "\n\n".join(
+                message.get("content", "")
+                for message in messages[last_user_index + 1:-1]
+                if isinstance(message, dict) and message.get("role") == "tool"
+            )
             return {
                 "type": "response",
-                "content": f"Based on my analysis using the business operations tools, here is the result for your request. The data has been retrieved and processed successfully. All relevant policies and database records have been consulted.",
+                "content": f"Here are the results from the business operations tools:\n\n{results}",
                 "tool_calls": [],
             }
 
         # Determine which tool to call based on keywords
-        if any(kw in last_lower for kw in ["sql", "query", "database", "customer", "order", "ticket", "revenue", "count", "select", "show", "list", "find", "how many"]):
+        if correction:
+            return {
+                "type": "tool_call",
+                "content": "The first attempt failed; retrying with a valid query against the known schema.",
+                "tool_calls": [{"tool": "query_business_db", "args": {"sql_query": "SELECT id, name, email, plan FROM customers LIMIT 5"}}],
+            }
+        if any(kw in last_lower for kw in ["schema", "table structure", "columns"]):
+            return {
+                "type": "tool_call",
+                "content": "I'll retrieve the database schema.",
+                "tool_calls": [{"tool": "get_schema", "args": {}}],
+            }
+        elif any(kw in last_lower for kw in ["create an action", "create action", "create a ticket", "create ticket", "resolve", "fix"]):
+            customer_match = re.search(r"\bcustomer(?:\s+id)?\s*#?\s*(\d+)\b", last_lower)
+            requested_priority = next(
+                (value for value in ("critical", "high", "medium", "low") if value in last_lower),
+                "medium",
+            )
+            return {
+                "type": "tool_call",
+                "content": "I'll create an action ticket.",
+                "tool_calls": [{"tool": "create_action_ticket", "args": {
+                    "customer_id": int(customer_match.group(1)) if customer_match else 1,
+                    "issue_summary": last_msg[:100],
+                    "priority": requested_priority,
+                    "resolution_action": "Investigate and resolve the reported issue",
+                }}],
+            }
+        elif (
+            any(kw in last_lower for kw in ["policy", "sla", "refund", "escalat", "procedure", "rule", "compliance"])
+            and not any(kw in last_lower for kw in ["show", "list", "find", "count", "query", "database", "records", "breach", "overdue"])
+        ):
+            return {
+                "type": "tool_call",
+                "content": "I'll search the policy documents.",
+                "tool_calls": [{"tool": "search_policy_docs", "args": {"query": last_msg[:200]}}],
+            }
+        elif any(kw in last_lower for kw in ["sql", "query", "database", "customer", "order", "ticket", "revenue", "count", "select", "show", "list", "find", "how many"]):
             return {
                 "type": "tool_call",
                 "content": "I'll query the business database to find this information.",
                 "tool_calls": [
                     {
                         "tool": "query_business_db",
-                        "args": {"sql_query": "SELECT * FROM customers LIMIT 5"},
+                        "args": {"sql_query": _mock_sql_for_task(last_msg)},
                     }
                 ],
-            }
-        elif any(kw in last_lower for kw in ["policy", "sla", "refund", "escalat", "procedure", "rule", "compliance"]):
-            return {
-                "type": "tool_call",
-                "content": "I'll search the policy documents.",
-                "tool_calls": [
-                    {
-                        "tool": "search_policy_docs",
-                        "args": {"query": last_msg[:200]},
-                    }
-                ],
-            }
-        elif any(kw in last_lower for kw in ["create", "action", "resolve", "fix"]):
-            return {
-                "type": "tool_call",
-                "content": "I'll create an action ticket.",
-                "tool_calls": [
-                    {
-                        "tool": "create_action_ticket",
-                        "args": {
-                            "customer_id": 1,
-                            "issue_summary": last_msg[:100],
-                            "priority": "medium",
-                            "resolution_action": "Investigate and resolve the reported issue",
-                        },
-                    }
-                ],
-            }
-        elif any(kw in last_lower for kw in ["schema", "table", "structure", "column"]):
-            return {
-                "type": "tool_call",
-                "content": "I'll retrieve the database schema.",
-                "tool_calls": [{"tool": "get_schema", "args": {}}],
             }
         else:
             return {
@@ -330,7 +402,7 @@ class MockLLM:
                 "tool_calls": [
                     {
                         "tool": "query_business_db",
-                        "args": {"sql_query": "SELECT * FROM customers LIMIT 5"},
+                        "args": {"sql_query": _mock_sql_for_task(last_msg)},
                     }
                 ],
             }
@@ -365,12 +437,14 @@ def router_planner(state: AgentState) -> AgentState:
             "1. query_business_db(sql_query) - Execute read-only SQL on the business DB\n"
             "2. search_policy_docs(query) - Search company policy/SOP documents\n"
             "3. create_action_ticket(customer_id, issue_summary, priority, resolution_action) - Create action tickets\n"
-            "4. get_schema() - View database table schemas\n\n"
-            "Analyze the user's request and determine which tools to use."
+            "4. get_schema() - Read config://schema from the MCP server\n\n"
+            "Analyze the latest user request. Return only valid JSON with keys `content` (short plan) "
+            "and `tool_calls` (array of objects with `tool` and `args`). Use an empty array only when no tool is needed."
         ),
     }
 
-    all_messages = [system_msg] + messages
+    # Gemini's chat adapter expects standard roles; internal tool transcript is summarized separately.
+    all_messages = [system_msg] + [m for m in messages if m.get("role") in ("user", "assistant", "system")]
     response = llm.invoke(all_messages)
 
     if isinstance(response, dict):
@@ -379,6 +453,15 @@ def router_planner(state: AgentState) -> AgentState:
     else:
         plan = getattr(response, "content", str(response))
         tool_calls = []
+        try:
+            candidate = plan.strip()
+            if candidate.startswith("```"):
+                candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate)
+            payload = json.loads(candidate)
+            plan = payload.get("content", "")
+            tool_calls = payload.get("tool_calls", [])
+        except (json.JSONDecodeError, AttributeError):
+            plan = plan or "Could not parse a tool plan from the model response."
 
     trace.append({
         "node": "router_planner",
@@ -401,8 +484,36 @@ def router_planner(state: AgentState) -> AgentState:
     }
 
 
-def tool_executor(state: AgentState) -> AgentState:
-    """Tool Executor node: Executes MCP tool calls and collects results."""
+async def _invoke_mcp(tool_name: str, args: dict[str, Any]) -> str:
+    """Start the local MCP server, discover its capabilities, and invoke one."""
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mcp_server.server"],
+        cwd=BASE_DIR,
+        env=os.environ.copy(),
+    )
+    async with stdio_client(params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            if tool_name == "get_schema":
+                resource = await session.read_resource("config://schema")
+                return "\n".join(
+                    item.text for item in resource.contents if hasattr(item, "text")
+                )
+
+            available = await session.list_tools()
+            if tool_name not in {tool.name for tool in available.tools}:
+                return f"TOOL_ERROR: Unknown MCP tool '{tool_name}'"
+            result = await session.call_tool(tool_name, arguments=args)
+            text_parts = [item.text for item in result.content if hasattr(item, "text")]
+            structured = getattr(result, "structuredContent", None) or getattr(result, "structured_content", None) or {}
+            output = "\n".join(text_parts) or json.dumps(structured)
+            is_error = getattr(result, "isError", getattr(result, "is_error", False))
+            return f"TOOL_ERROR: {output}" if is_error else output
+
+
+async def tool_executor(state: AgentState) -> AgentState:
+    """Tool Executor node: Executes tool calls through the MCP client protocol."""
     tool_calls = state.get("tool_calls", [])
     trace = list(state.get("trace", []))
     tool_results = []
@@ -420,17 +531,16 @@ def tool_executor(state: AgentState) -> AgentState:
         }
 
         if tool_name in TOOLS_REGISTRY:
-            fn = TOOLS_REGISTRY[tool_name]["fn"]
             try:
-                result = fn(**args)
-                trace_entry["status"] = "success"
-                trace_entry["result_preview"] = result[:200] if isinstance(result, str) else str(result)[:200]
+                result = await _invoke_mcp(tool_name, args)
+                trace_entry["status"] = "error" if result.startswith(("ERROR:", "SQL_ERROR:", "TOOL_ERROR:", "DATABASE_ERROR:")) else "success"
+                trace_entry["result_preview"] = result[:200]
             except Exception as e:
                 result = f"TOOL_ERROR: {e}"
                 trace_entry["status"] = "error"
                 trace_entry["error"] = str(e)
         else:
-            result = f"ERROR: Unknown tool '{tool_name}'"
+            result = f"TOOL_ERROR: Unknown tool '{tool_name}'"
             trace_entry["status"] = "error"
             trace_entry["error"] = f"Unknown tool: {tool_name}"
 
@@ -465,7 +575,7 @@ def validator(state: AgentState) -> AgentState:
     for tr in tool_results:
         result = tr.get("result", "")
         if isinstance(result, str) and any(
-            err in result for err in ["SQL_ERROR:", "TOOL_ERROR:", "DATABASE_ERROR:"]
+            result.startswith(err) for err in ["ERROR:", "SQL_ERROR:", "TOOL_ERROR:", "DATABASE_ERROR:"]
         ):
             if correction_count < MAX_CORRECTION_LOOPS:
                 needs_correction = True
@@ -519,10 +629,14 @@ def synthesizer(state: AgentState) -> AgentState:
 
     synthesis_msg = {
         "role": "user",
-        "content": f"Based on the tool results below, provide a clear, comprehensive answer.\n\nTool Results:{results_summary}",
+        "content": (
+            f"Based on the tool results below, answer this user task clearly: {state.get('current_task', '')}"
+            f"\n\nTool Results:{results_summary}"
+        ),
     }
 
-    response = llm.invoke(messages + [synthesis_msg])
+    synthesis_messages = messages + [synthesis_msg] if isinstance(llm, MockLLM) else [synthesis_msg]
+    response = llm.invoke(synthesis_messages)
 
     if isinstance(response, dict):
         final_response = response.get("content", "")
@@ -542,7 +656,7 @@ def synthesizer(state: AgentState) -> AgentState:
     })
 
     return {
-        "messages": messages,
+        "messages": messages + [{"role": "assistant", "content": final_response}],
         "current_task": state.get("current_task", ""),
         "plan": state.get("plan", ""),
         "tool_calls": state.get("tool_calls", []),
@@ -605,8 +719,15 @@ compiled_graph = _workflow.compile(checkpointer=_memory)
 
 async def run_agent(task: str, thread_id: str = "default") -> dict:
     """Execute the agent workflow for a given task."""
+    config = {"configurable": {"thread_id": thread_id}}
+    previous = await compiled_graph.aget_state(config)
+    messages = list(previous.values.get("messages", [])) if previous and previous.values else []
+    messages = [m for m in messages if not (
+        m.get("role") == "system" and "previous tool call" in m.get("content", "")
+    )]
+    messages.append({"role": "user", "content": task})
     initial_state: AgentState = {
-        "messages": [{"role": "user", "content": task}],
+        "messages": messages,
         "current_task": task,
         "plan": "",
         "tool_calls": [],
@@ -617,8 +738,6 @@ async def run_agent(task: str, thread_id: str = "default") -> dict:
         "error": "",
         "trace": [],
     }
-
-    config = {"configurable": {"thread_id": thread_id}}
 
     # Use ainvoke for a single run
     final_state = await compiled_graph.ainvoke(initial_state, config=config)
@@ -633,8 +752,15 @@ async def run_agent(task: str, thread_id: str = "default") -> dict:
 
 async def stream_agent(task: str, thread_id: str = "default"):
     """Stream agent workflow steps as they execute."""
+    config = {"configurable": {"thread_id": thread_id}}
+    previous = await compiled_graph.aget_state(config)
+    messages = list(previous.values.get("messages", [])) if previous and previous.values else []
+    messages = [m for m in messages if not (
+        m.get("role") == "system" and "previous tool call" in m.get("content", "")
+    )]
+    messages.append({"role": "user", "content": task})
     initial_state: AgentState = {
-        "messages": [{"role": "user", "content": task}],
+        "messages": messages,
         "current_task": task,
         "plan": "",
         "tool_calls": [],
@@ -645,8 +771,6 @@ async def stream_agent(task: str, thread_id: str = "default"):
         "error": "",
         "trace": [],
     }
-
-    config = {"configurable": {"thread_id": thread_id}}
 
     async for event in compiled_graph.astream(initial_state, config=config):
         for node_name, node_output in event.items():

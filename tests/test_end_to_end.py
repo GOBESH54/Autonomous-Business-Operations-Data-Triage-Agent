@@ -148,6 +148,20 @@ class TestPolicyDocs:
 class TestMCPTools:
     """Test the MCP tool implementations directly."""
 
+    @pytest.mark.asyncio
+    async def test_agent_uses_mcp_client_tools_and_resource(self):
+        """Exercise the official MCP stdio client/server lifecycle."""
+        from agent.workflow import _invoke_mcp
+
+        tool_output = await _invoke_mcp(
+            "query_business_db", {"sql_query": "SELECT COUNT(*) AS total FROM customers"}
+        )
+        schema_output = await _invoke_mcp("get_schema", {})
+
+        assert "total" in tool_output
+        assert "customers" in schema_output
+        assert "support_tickets" in schema_output
+
     def test_query_business_db_select(self):
         from agent.workflow import tool_query_business_db
         result = tool_query_business_db("SELECT COUNT(*) as total FROM customers")
@@ -274,6 +288,20 @@ class TestLangGraphWorkflow:
         assert result["thread_id"] == "test-db-query"
 
     @pytest.mark.asyncio
+    async def test_offline_planner_queries_requested_business_table(self):
+        from agent.workflow import run_agent
+
+        result = await run_agent(
+            task="Find open critical support tickets",
+            thread_id="test-specific-ticket-query",
+        )
+        tool_result = result["tool_results"][0]["result"]
+
+        assert "Login failure after password reset" in tool_result
+        assert "Data loss incident" in tool_result
+        assert "SSO integration broken" not in tool_result  # resolved ticket excluded
+
+    @pytest.mark.asyncio
     async def test_run_agent_policy_search(self):
         from agent.workflow import run_agent
         result = await run_agent(
@@ -301,6 +329,37 @@ class TestLangGraphWorkflow:
             thread_id="test-schema",
         )
         assert result["response"]
+
+    @pytest.mark.asyncio
+    async def test_graph_retries_after_mcp_sql_error(self, monkeypatch):
+        """Verify an MCP SQL error routes through planner correction and a second call."""
+        import agent.workflow as workflow
+
+        fallback = workflow.MockLLM()
+
+        class FailOncePlanner:
+            def __init__(self):
+                self.first = True
+
+            def invoke(self, messages, **kwargs):
+                if self.first:
+                    self.first = False
+                    return {
+                        "content": "Try an initial database query.",
+                        "tool_calls": [{
+                            "tool": "query_business_db",
+                            "args": {"sql_query": "SELECT * FROM missing_table"},
+                        }],
+                    }
+                return fallback.invoke(messages, **kwargs)
+
+        planner = FailOncePlanner()
+        monkeypatch.setattr(workflow, "_get_llm", lambda: planner)
+        result = await workflow.run_agent("Show customers", thread_id="retry-e2e")
+
+        assert result["response"]
+        assert len([step for step in result["trace"] if step["node"] == "tool_executor"]) == 2
+        assert any(step.get("needs_correction") for step in result["trace"] if step["node"] == "validator")
 
     @pytest.mark.asyncio
     async def test_workflow_trace_has_all_nodes(self):
